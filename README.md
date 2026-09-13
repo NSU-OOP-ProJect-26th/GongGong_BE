@@ -60,7 +60,50 @@
 | Cache / Lock | Redis, Redisson | 캐싱(Look-aside) 및 분산락(2단계) 구현 |
 | 외부 연동 | 서울 열린데이터광장 문화행사 공공서비스예약 API (XML) | 자치구별로 별도 API가 제공됨, [6번](#6-공공데이터-동기화-설계) 참고 |
 | Build Tool | Gradle | |
-| 부하 테스트 (예정) | nGrinder / K6 등 | 1단계 vs 2단계 성능·정합성 비교용, [11. 구현 예정](#11-구현-예정-확장-예정-기능) 참고 |
+| 부하 테스트 | nGrinder / K6 등 | 1단계 vs 2단계 성능·정합성 비교용, [7-3. 부하 테스트 계획](#7-3-부하-테스트-계획) 참고 |
+
+### 필요 의존성 (build.gradle)
+
+위 스택을 기준으로 `build.gradle`에 추가해야 하는 의존성입니다. 관심사별로 그룹핑했습니다.
+
+```groovy
+dependencies {
+    // Web / 기본
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // JPA + DB
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly 'com.mysql:mysql-connector-j'
+    // PostgreSQL을 쓸 경우: runtimeOnly 'org.postgresql:postgresql'
+
+    // Security + JWT
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
+    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
+    runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.6'
+
+    // Redis + Redisson (캐싱 + 분산락, 7단계 참고)
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.redisson:redisson-spring-boot-starter:3.37.0'
+
+    // 공공데이터 XML 파싱 (6번 동기화 설계에서 사용)
+    implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-xml'
+
+    // 보일러플레이트 축소 (선택)
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    // 테스트
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+}
+```
+
+**참고**
+- `jjwt`, `redisson-spring-boot-starter` 버전은 사용하는 Spring Boot 버전과의 호환 여부를 먼저 확인하고 최신 안정 버전으로 맞춥니다.
+- API 문서화가 필요하면 `org.springdoc:springdoc-openapi-starter-webmvc-ui`를 추가로 검토합니다(현재 스택에는 필수 항목으로 넣지 않음).
+- 외부 API(서울 열린데이터광장) 호출은 Spring Web에 포함된 `RestClient`/`RestTemplate`으로 처리하므로 별도 HTTP 클라이언트 의존성은 불필요합니다.
 
 ---
 
@@ -382,7 +425,7 @@ Response 예시:
 
 동시성 제어는 이 프로젝트의 핵심 검증 대상이므로, 한 번에 최종 구현을 적용하지 않고 **1단계(비관적 락) → 2단계(Redisson 분산락)** 순서로 단계를 나누어 구현합니다. 이렇게 나누는 이유는 (1) 먼저 가장 단순한 방식으로 정합성을 보장하는 baseline을 만들고, (2) 이후 분산락으로 전환했을 때의 성능/구조적 차이를 실측 비교할 수 있도록 하기 위함입니다.
 
-### 1단계: 비관적 락 (`SELECT ... FOR UPDATE`)
+### 7-1. 비관적 락 (`SELECT ... FOR UPDATE`)
 
 - **적용 대상**: `reservation.service.ReservationService.reserve(userId, slotId)`
   - `ReservationSlotRepository`에 `@Lock(LockModeType.PESSIMISTIC_WRITE)`를 적용한 `findByIdForUpdate(Long slotId)` 메서드를 정의하고, `reserve()` 내에서 이 메서드로 슬롯을 조회
@@ -394,7 +437,7 @@ Response 예시:
   - 락을 획득한 트랜잭션이 끝날 때까지 다른 요청은 DB 커넥션을 점유한 채 대기하므로, 동시 요청이 많아질수록 커넥션 풀이 고갈되어 전체 처리량이 급격히 떨어질 수 있습니다.
   - 애플리케이션을 다중 인스턴스로 확장(scale-out)해도 동기화 지점이 여전히 단일 DB이므로, 애플리케이션 서버를 늘리는 것만으로는 처리량이 늘지 않습니다.
 
-### 2단계: Redisson 분산락
+### 7-2. Redisson 분산락
 
 - **적용 대상**: 동일한 `ReservationService.reserve()` 메서드
   - `common.lock.@DistributedLock` 어노테이션 + AOP(`DistributedLockAspect`)를 도입하여, `RedissonClient.getLock("reservation:slot:{slotId}")` 형태의 키로 락을 획득/해제하는 로직을 공통화
@@ -405,13 +448,23 @@ Response 예시:
   - Redisson을 선택한 이유는, 순수 `Jedis`/`Lettuce`로 직접 분산락을 구현할 경우 락 획득 재시도를 spin-lock(반복 polling) 방식으로 처리해야 해 Redis에 불필요한 부하가 발생하는데, Redisson은 pub/sub 기반 대기 방식(`Lock` 해제 시 대기 중인 클라이언트에 알림)을 제공하여 같은 목적을 더 낮은 Redis 부하로 달성할 수 있기 때문입니다.
   - `@DistributedLock` 어노테이션 + AOP로 공통화하는 이유는, 락 획득/해제/예외 처리 로직이 비즈니스 로직과 섞이면 실수로 락 해제를 빠뜨리는 등의 버그가 발생하기 쉬우므로, 횡단 관심사(cross-cutting concern)로 분리해 안전하게 재사용하기 위함입니다.
 
-### 비교 검증 계획
+### 7-3. 부하 테스트 계획
 
-- 1단계와 2단계 각각에 대해 동일한 시나리오(예: [6-3](#6-3-capacity모집-정원-부여-규칙)의 규칙으로 부여된 정원 30명 슬롯에 200명 동시 요청)로 부하 테스트를 수행하여 다음을 비교합니다.
-  - 오버부킹 발생 여부(정합성): 두 방식 모두 0건이어야 함 — 원본 데이터에서 관찰된 "조기 마감"을 우리 시스템에서는 정원을 넘기지 않고 정확히 재현할 수 있는지가 핵심 검증 포인트
-  - TPS(처리량) 및 P99 응답 시간
-  - DB 커넥션 풀 사용률
-- 구체적인 부하 테스트 도구/시나리오는 [11. 구현 예정](#11-구현-예정-확장-예정-기능)에서 별도로 다룹니다.
+이 프로젝트가 실제로 증명해야 하는 주장은 "Redisson 분산락이 비관적 락보다 낫다"가 아니라, **정합성을 유지하면서 성능이 개선되는지를 숫자로 보여주는 것**입니다. 이 숫자는 코드 구현만으로는 나오지 않고 부하 테스트로 직접 측정해야 하므로, 부하 테스트를 [11. 구현 예정](#11-구현-예정-확장-예정-기능) 같은 부가 기능이 아니라 **동시성 제어 구현의 마지막 필수 단계**로 둡니다. 7-1, 7-2를 구현만 해두고 부하 테스트를 하지 않으면, 이 프로젝트의 핵심 결론(발표자료의 핵심 그래프)을 낼 방법이 없습니다.
+
+**테스트 시나리오**
+- 대상 슬롯: [6-3](#6-3-capacity모집-정원-부여-규칙) 규칙으로 정원이 부여된 슬롯 중 하나를 고정(예: 정원 30명)
+- 부하: 동일 슬롯에 200명 동시 요청(가상 사용자 수를 단계적으로 늘려 50 → 100 → 200명까지 스텝별로 측정)
+- 반복: 1단계(비관적 락)로 1회, 2단계(Redisson 분산락)로 1회, 동일 시나리오·동일 정원으로 재실행하여 조건을 통제
+
+**측정 지표**
+- **정합성**: 오버부킹 발생 건수(0건이어야 함), `SUCCESS` 처리된 예약 수가 정확히 `capacity`와 일치하는지
+- **성능**: TPS(처리량), 응답 시간(P50/P95/P99), 에러율
+- **자원 사용**: DB 커넥션 풀 사용률·대기 시간(1단계에서 특히 중요), Redis 명령 처리량(2단계에서 특히 중요)
+
+**도구**
+- nGrinder 또는 K6 중 하나를 선택해 시나리오를 스크립트화하고, 자치구/카테고리 필터가 아닌 **`POST /api/reservations` 단일 엔드포인트에 집중**한 테스트로 구성합니다(캐싱 효과는 [8번](#8-캐싱-전략) 조회 API 쪽에서 별도로 측정).
+- 테스트 결과(TPS, 오버부킹 건수 등)는 표/그래프로 기록해 두어, 1단계 대비 2단계의 개선 폭을 발표자료에 그대로 인용할 수 있도록 합니다.
 
 ---
 
@@ -481,4 +534,4 @@ Look-aside(Cache-Aside) 패턴을 적용합니다. 애플리케이션이 캐시�
 - **동기화 스케줄러 자동화**: 현재는 `POST /api/admin/sync`로 수동 트리거하지만, `@Scheduled`로 주기 실행(예: 1일 1회)하여 실제 운영에서처럼 데이터가 자동으로 최신화되는 구조로 전환
 - **메시지 큐(Kafka/RabbitMQ) 도입**: 현재는 예약 요청을 동기적으로 처리(락 획득 → DB 반영)하지만, 요청을 큐에 우선 적재하고 별도 컨슈머가 순차 처리하는 구조로 확장하면 DB에 도달하는 요청 자체를 줄여 더 높은 트래픽에도 안정적으로 대응할 수 있는지 검증
 - **WebSocket**: 예약 슬롯의 잔여 정원 변경이나 대기열 상태를 클라이언트에 실시간으로 push하여, 폴링 없이도 최신 상태를 보여주는 구조 검증
-- **부하 테스트 자동화 및 결과 기록**: nGrinder 또는 K6 등을 이용해 [7. 동시성 제어 구현 계획](#7-동시성-제어-구현-계획)에서 정의한 1단계 vs 2단계 비교 시나리오를 자동화하고, TPS/응답시간/오버부킹 여부를 정리하여 발표자료용 데이터로 축적
+- **부하 테스트 CI 통합**: [7-3. 부하 테스트 계획](#7-3-부하-테스트-계획)에서 수동으로 실행하던 시나리오를 CI 파이프라인에 연결해, 코드 변경 시마다 회귀적으로 정합성/성능을 자동 검증하는 구조로 확장
